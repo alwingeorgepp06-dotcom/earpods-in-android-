@@ -1,0 +1,250 @@
+name: Build APK
+on:
+  workflow_dispatch:
+  push:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Write project files
+        run: |
+          mkdir -p proj && cd proj
+          cat > settings.gradle.kts <<'EOF_FILE'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "TriplePress"
+          include(":app")
+          EOF_FILE
+          cat > build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_FILE
+          cat > gradle.properties <<'EOF_FILE'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=false
+          EOF_FILE
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.triplepress"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.triplepress"
+                  minSdk = 29
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF_FILE
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <application
+                  android:allowBackup="true"
+                  android:label="TriplePress"
+                  android:theme="@android:style/Theme.Material.Light">
+
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".ButtonService"
+                      android:exported="false"
+                      android:foregroundServiceType="mediaPlayback" />
+
+                  <service
+                      android:name=".Listener"
+                      android:exported="true"
+                      android:label="TriplePress"
+                      android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.service.notification.NotificationListenerService" />
+                      </intent-filter>
+                  </service>
+              </application>
+          </manifest>
+          EOF_FILE
+          mkdir -p app/src/main/java/com/example/triplepress
+          cat > app/src/main/java/com/example/triplepress/MainActivity.kt <<'EOF_FILE'
+          package com.example.triplepress
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Intent
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+
+          class MainActivity : Activity() {
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(48, 96, 48, 48) }
+                  box.addView(TextView(this).apply {
+                      text = "1. Allow notification access\n2. Start\n\nThen: 1 press = play/pause, 2 = next, 3 = previous."
+                      textSize = 16f
+                  })
+                  box.addView(Button(this).apply {
+                      text = "1. Notification access"
+                      setOnClickListener { startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)) }
+                  })
+                  box.addView(Button(this).apply {
+                      text = "2. Start"
+                      setOnClickListener {
+                          if (Build.VERSION.SDK_INT >= 33)
+                              requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+                          startForegroundService(Intent(this@MainActivity, ButtonService::class.java))
+                      }
+                  })
+                  box.addView(Button(this).apply {
+                      text = "Stop"
+                      setOnClickListener { stopService(Intent(this@MainActivity, ButtonService::class.java)) }
+                  })
+                  setContentView(box)
+              }
+          }
+          EOF_FILE
+          mkdir -p app/src/main/java/com/example/triplepress
+          cat > app/src/main/java/com/example/triplepress/ButtonService.kt <<'EOF_FILE'
+          package com.example.triplepress
+
+          import android.app.*
+          import android.content.ComponentName
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.media.session.MediaController
+          import android.media.session.MediaSession
+          import android.media.session.MediaSessionManager
+          import android.media.session.PlaybackState
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.view.KeyEvent
+
+          class ButtonService : Service() {
+
+              private lateinit var session: MediaSession
+              private val handler = Handler(Looper.getMainLooper())
+              private var taps = 0
+              private val tapWindowMs = 450L   // raise if triple press feels too hard
+
+              private val fire = Runnable {
+                  val count = taps
+                  taps = 0
+                  val c = target() ?: return@Runnable
+                  when (count) {
+                      1 -> if (c.playbackState?.state == PlaybackState.STATE_PLAYING)
+                              c.transportControls.pause() else c.transportControls.play()
+                      2 -> c.transportControls.skipToNext()
+                      else -> c.transportControls.skipToPrevious()   // 3 or more
+                  }
+              }
+
+              override fun onCreate() {
+                  super.onCreate()
+                  val ch = NotificationChannel("tp", "TriplePress", NotificationManager.IMPORTANCE_LOW)
+                  getSystemService(NotificationManager::class.java).createNotificationChannel(ch)
+                  val n = Notification.Builder(this, "tp")
+                      .setContentTitle("TriplePress is running")
+                      .setContentText("Earphone buttons: 1 play/pause, 2 next, 3 previous")
+                      .setSmallIcon(android.R.drawable.ic_media_play)
+                      .build()
+                  startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
+
+                  session = MediaSession(this, "TriplePress").apply {
+                      setCallback(object : MediaSession.Callback() {
+                          @Suppress("DEPRECATION")
+                          override fun onMediaButtonEvent(intent: Intent): Boolean {
+                              val e = intent.getParcelableExtra<KeyEvent>(Intent.EXTRA_KEY_EVENT)
+                                  ?: return false
+                              if (e.action != KeyEvent.ACTION_DOWN || e.repeatCount > 0) return true
+                              when (e.keyCode) {
+                                  KeyEvent.KEYCODE_HEADSETHOOK,
+                                  KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> {
+                                      taps++
+                                      handler.removeCallbacks(fire)
+                                      if (taps >= 3) fire.run() else handler.postDelayed(fire, tapWindowMs)
+                                  }
+                                  KeyEvent.KEYCODE_MEDIA_NEXT -> target()?.transportControls?.skipToNext()
+                                  KeyEvent.KEYCODE_MEDIA_PREVIOUS -> target()?.transportControls?.skipToPrevious()
+                              }
+                              return true
+                          }
+                      })
+                      setPlaybackState(
+                          PlaybackState.Builder()
+                              .setActions(PlaybackState.ACTION_PLAY_PAUSE)
+                              .setState(PlaybackState.STATE_PLAYING, 0, 1f)
+                              .build()
+                      )
+                      isActive = true
+                  }
+              }
+
+              /** The media app we should control: a playing one if any, else the first other one. */
+              private fun target(): MediaController? {
+                  return try {
+                      val mgr = getSystemService(MediaSessionManager::class.java)
+                      val list = mgr.getActiveSessions(ComponentName(this, Listener::class.java))
+                          .filter { it.packageName != packageName }
+                      list.firstOrNull { it.playbackState?.state == PlaybackState.STATE_PLAYING }
+                          ?: list.firstOrNull()
+                  } catch (e: SecurityException) {
+                      null   // notification access not granted yet
+                  }
+              }
+
+              override fun onDestroy() {
+                  session.release()
+                  super.onDestroy()
+              }
+
+              override fun onBind(i: Intent?): IBinder? = null
+          }
+          EOF_FILE
+          mkdir -p app/src/main/java/com/example/triplepress
+          cat > app/src/main/java/com/example/triplepress/Listener.kt <<'EOF_FILE'
+          package com.example.triplepress
+
+          import android.service.notification.NotificationListenerService
+
+          // Empty on purpose. Enabling it gives the app permission to control other apps' media sessions.
+          class Listener : NotificationListenerService()
+          EOF_FILE
+      - name: Build
+        run: cd proj && gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TriplePress-apk
+          path: proj/app/build/outputs/apk/debug/app-debug.apk
